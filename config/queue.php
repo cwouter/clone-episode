@@ -57,7 +57,7 @@ return [
                     'passphrase' => env('RABBITMQ_SSL_PASSPHRASE', null),
                 ],
                 'exchange' => [
-                    'name' => env('RABBITMQ_EXCHANGE', 'laravel'),
+                    'name' => env('RABBITMQ_EXCHANGE', 'default'),
                     'type' => env('RABBITMQ_EXCHANGE_TYPE', 'direct'),
                     'passive' => env('RABBITMQ_EXCHANGE_PASSIVE', false),
                     'durable' => env('RABBITMQ_EXCHANGE_DURABLE', true),

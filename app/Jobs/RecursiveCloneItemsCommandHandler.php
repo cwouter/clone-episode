@@ -3,61 +3,96 @@
 namespace App\Jobs;
 
 use App\Events\RecursiveCloneBlocksCommand;
-use App\Services\ChunkingService;
-use App\Services\CloneService;
+use App\Events\RecursiveCloneItemsCommand;
+use App\Events\RevertRecursiveCloneItemsCommand;
 use App\Services\IdempotencyService;
+use App\Services\ItemsService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Log\Logger;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Redis;
 use Throwable;
 
 class RecursiveCloneItemsCommandHandler implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public object $command;
-
-    public function __construct(object $command)
+    public function __construct(protected RecursiveCloneItemsCommand $command)
     {
-        $this->command = $command;
     }
 
-    public function handle(CloneService $cloneService, ChunkingService $chunkingService, IdempotencyService $idempotencyService): void
+    /**
+     * @throws Throwable
+     */
+    public function handle(ItemsService $itemsService, IdempotencyService $idempotencyService, Logger $log): void
     {
+        $log->info(self::class . ' started', ['command' => $this->command]);
+
         if ($idempotencyService->isProcessed($this->command->transactionId)) {
             return;
         }
 
-        $partMappingJson = Redis::get("clone:parts:{$this->command->traceId}");
-        $partMapping = $partMappingJson !== null ? json_decode($partMappingJson, true) : [];
+        try {
+            $newItemsMapping = $itemsService->cloneItems(
+                $this->command->items,
+                $this->command->newPartUuid
+            );
 
-        $itemUuids = $this->command->items;
+            $oldUuids = $this->getArrayString(array_keys($newItemsMapping));
+            $newUuids = $this->getArrayString(array_values($newItemsMapping));
 
-        $itemMapping = $cloneService->cloneItems($itemUuids, $partMapping);
+            $chunkSize = (int)config('cloning.chunk_size_blocks');
 
-        if ($itemMapping !== []) {
-            Redis::set("clone:items:{$this->command->traceId}", json_encode($itemMapping));
+            // Fetch results in chunks to avoid hitting a memory limit.
+            DB::table('blocks')
+                ->select('b.uuid AS block_uuid')
+                ->selectRaw('map.new_item_uuid')
+                ->fromRaw("
+                blocks b
+                JOIN UNNEST(?::uuid[], ?::uuid[]) AS map(old_item_uuid, new_item_uuid)
+                  ON b.item_uuid = map.old_item_uuid
+            ", [$oldUuids, $newUuids])
+                ->orderBy('map.new_item_uuid')
+                ->chunk($chunkSize, fn(Collection $items) => $this->dispatchChunk($items));
+
+            $idempotencyService->markAsProcessed($this->command->transactionId, (int)config('cloning.transaction_ttl'));
+        } catch (Throwable $e) {
+            $log->error("Failed to clone items: " . $e->getMessage());
+            $this->performRollback($e);
+
+            throw $e;
         }
+    }
 
-        $blockUuids = DB::table('blocks')
-            ->whereIn('item_uuid', $itemUuids)
-            ->pluck('uuid')
-            ->all();
+    private function getArrayString(array $uuids): string
+    {
+        return '{' . implode(',', $uuids) . '}';
+    }
 
-        if ($blockUuids !== []) {
-            $chunks = $chunkingService->chunkArray($blockUuids, (int) config('cloning.chunk_size'));
-            $commands = $chunkingService->createChunkedCommands($chunks, $this->command->traceId, RecursiveCloneBlocksCommand::class);
-
-            foreach ($commands as $command) {
-                RecursiveCloneBlocksCommandHandler::dispatch($command);
-            }
+    private function dispatchChunk(Collection $items): void
+    {
+        // Events should be grouped per part UUID.
+        // This will reduce the size of the payload sent to the event queue.
+        // And makes it easier to query on the consuming side.
+        $blocksByItem = $items->groupBy('new_item_uuid');
+        foreach ($blocksByItem as $newItemUuid => $items) {
+            $command = RecursiveCloneBlocksCommand::fromCommand($this->command);
+            $command->blocks = $items->pluck('block_uuid')->all();
+            $command->newItemUuid = $newItemUuid;
+            RecursiveCloneBlocksCommandHandler::dispatch($command);
         }
+    }
 
-        $idempotencyService->markAsProcessed($this->command->transactionId, (int) config('cloning.transaction_ttl'));
+    public function performRollback(Throwable $e): void
+    {
+        $this->fail($e);
+        $command = RevertRecursiveCloneItemsCommand::fromCommand($this->command);
+        $command->partUuid = $this->command->newPartUuid;
+        RevertRecursiveCloneItemsCommandHandler::dispatch($command);
     }
 
     public function failed(Throwable $exception): void

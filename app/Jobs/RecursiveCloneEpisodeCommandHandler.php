@@ -2,57 +2,74 @@
 
 namespace App\Jobs;
 
+use App\Events\RecursiveCloneEpisodeCommand;
 use App\Events\RecursiveClonePartsCommand;
-use App\Services\ChunkingService;
-use App\Services\CloneService;
+use App\Events\RevertRecursiveCloneEpisodeCommand;
+use App\Services\EpisodeService;
 use App\Services\IdempotencyService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Log\Logger;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Redis;
 use Throwable;
 
 class RecursiveCloneEpisodeCommandHandler implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public object $command;
-
-    public function __construct(object $command)
+    public function __construct(protected RecursiveCloneEpisodeCommand $command)
     {
-        $this->command = $command;
     }
 
-    public function handle(CloneService $cloneService, ChunkingService $chunkingService, IdempotencyService $idempotencyService): void
+    /**
+     * @throws Throwable
+     */
+    public function handle(EpisodeService $episodeService, IdempotencyService $idempotencyService, Logger $log): void
     {
+        $log->info(self::class . ' started', ['command' => $this->command]);
+
         if ($idempotencyService->isProcessed($this->command->transactionId)) {
             return;
         }
 
-        $episodeMapping = $cloneService->cloneEpisode($this->command->episodeUuid);
-        $newEpisodeUuid = $episodeMapping['new_uuid'];
+        try {
+            $newEpisodeUuid = $episodeService->cloneEpisode($this->command->episodeUuid);
 
-        Redis::set("clone:episode:{$this->command->traceId}", $newEpisodeUuid);
+            $partUuids = DB::table('parts')
+                ->where('episode_uuid', $this->command->episodeUuid)
+                ->pluck('uuid')
+                ->all();
 
-        $partUuids = DB::table('parts')
-            ->where('episode_uuid', $this->command->episodeUuid)
-            ->pluck('uuid')
-            ->all();
-
-        if ($partUuids !== []) {
-            $chunks = $chunkingService->chunkArray($partUuids, (int) config('cloning.chunk_size'));
-            $commands = $chunkingService->createChunkedCommands($chunks, $this->command->traceId, RecursiveClonePartsCommand::class);
-
-            foreach ($commands as $command) {
-                RecursiveClonePartsCommandHandler::dispatch($command);
+            if ($partUuids !== []) {
+                $chunks = array_chunk($partUuids, (int)config('cloning.chunk_size_parts'));
+                foreach ($chunks as $chunk) {
+                    $command = RecursiveClonePartsCommand::fromCommand($this->command);
+                    $command->newEpisodeUuid = $newEpisodeUuid;
+                    $command->parts = $chunk;
+                    RecursiveClonePartsCommandHandler::dispatch($command);
+                }
             }
-        }
 
-        $idempotencyService->markAsProcessed($this->command->transactionId, (int) config('cloning.transaction_ttl'));
+            $idempotencyService->markAsProcessed($this->command->transactionId, (int)config('cloning.transaction_ttl'));
+        } catch (Throwable $e) {
+            $log->error("Failed to clone episode {$this->command->episodeUuid}: " . $e->getMessage());
+            $this->performRollback($e);
+
+            throw $e;
+        }
     }
+
+    public function performRollback(Throwable $e): void
+    {
+        $this->fail($e);
+        $command = RevertRecursiveCloneEpisodeCommand::fromCommand($this->command);
+        $command->episodeUuid = $this->command->episodeUuid;
+        RevertRecursiveCloneEpisodeCommandHandler::dispatch($command);
+    }
+
 
     public function failed(Throwable $exception): void
     {

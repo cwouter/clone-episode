@@ -5,4 +5,6 @@ namespace App\Events;
 class RecursiveClonePartsCommand extends BaseCommand
 {
     public array $parts;
+
+    public string $newEpisodeUuid;
 }

@@ -18,95 +18,109 @@ class EpisodeSeeder extends Seeder
 
     public function run(): void
     {
-        $s3Client = new S3Client([
-            'version' => 'latest',
-            'region' => config('filesystems.disks.s3.region'),
-            'endpoint' => config('filesystems.disks.s3.endpoint'),
-            'use_path_style_endpoint' => config('filesystems.disks.s3.use_path_style_endpoint'),
-            'credentials' => [
-                'key' => config('filesystems.disks.s3.key'),
-                'secret' => config('filesystems.disks.s3.secret'),
-            ],
-        ]);
-
-        $bucket = config('filesystems.disks.s3.bucket');
-
-        $episode = DB::selectOne('INSERT INTO episodes (title, description) VALUES (?, ?) RETURNING uuid', [
-            'Sample Episode for Testing',
-            'This is a test episode with nested structure',
-        ]);
-
+        $episode = $this->createEpisode();
         $episodeUuid = $episode->uuid;
 
-        for ($p = 1; $p <= 5; $p++) {
-            $part = DB::selectOne('INSERT INTO parts (episode_uuid, name, description) VALUES (?, ?, ?) RETURNING uuid', [
-                $episodeUuid,
-                'Part '.$p,
-                'Description for part '.$p,
-            ]);
-
+        for ($p = 1; $p <= 2; $p++) {
+            $part = $this->createPart($episodeUuid, $p);
             $partUuid = $part->uuid;
 
-            for ($i = 1; $i <= 10; $i++) {
-                $item = DB::selectOne('INSERT INTO items (part_uuid, name, details) VALUES (?, ?, ?) RETURNING uuid', [
-                    $partUuid,
-                    'Item '.$i.' of Part '.$p,
-                    'Details for item '.$i,
-                ]);
-
+            for ($i = 1; $i <= 2; $i++) {
+                $item = $this->createItem($partUuid, $i, $p);
                 $itemUuid = $item->uuid;
 
                 for ($b = 1; $b <= 3; $b++) {
                     $blockType = $b === 1 ? 'text' : ($b === 2 ? 'image' : 'video');
 
-                    $block = DB::selectOne('INSERT INTO blocks (item_uuid, type, description) VALUES (?, ?, ?) RETURNING uuid', [
-                        $itemUuid,
-                        $blockType,
-                        'Block '.$b.' description',
-                    ]);
-
+                    $block = $this->createBlock($itemUuid, $blockType, $b);
                     $blockUuid = $block->uuid;
 
                     for ($bf = 1; $bf <= 2; $bf++) {
-                        DB::insert('INSERT INTO block_fields (block_uuid, field_name, field_value, field_type) VALUES (?, ?, ?, ?)', [
-                            $blockUuid,
-                            'field_'.$bf,
-                            'Value '.$bf.' for block',
-                            'string',
-                        ]);
+                        $this->createBlockField($blockUuid, $bf);
                     }
 
                     if (in_array($b, [2, 3], true)) {
-                        $extension = $b === 2 ? 'jpg' : 'mp4';
-                        $s3Key = 'media/'.Str::uuid().'.'.$extension;
-
-                        $dummyContent = 'Dummy '.$blockType.' content for testing';
-
-                        $s3Client->putObject([
-                            'Bucket' => $bucket,
-                            'Key' => $s3Key,
-                            'Body' => $dummyContent,
-                            'ContentType' => $b === 2 ? 'image/jpeg' : 'video/mp4',
-                        ]);
-
-                        $url = $s3Client->getObjectUrl($bucket, $s3Key);
-
-                        DB::insert(
-                            'INSERT INTO media (block_uuid, media_type, s3_key, s3_bucket, url, metadata) VALUES (?, ?, ?, ?, ?, ?::jsonb)',
-                            [
-                                $blockUuid,
-                                $b === 2 ? 'image/jpeg' : 'video/mp4',
-                                $s3Key,
-                                $bucket,
-                                $url,
-                                json_encode(['size' => strlen($dummyContent), 'width' => 800, 'height' => 600]),
-                            ]
-                        );
+                        $this->createMedia($itemUuid, $blockUuid, $blockType, $b);
                     }
                 }
             }
         }
 
-        $this->command?->info('Seeded 1 episode with UUID: '.$episodeUuid);
+        $this->command?->info('Seeded 1 episode with UUID: ' . $episodeUuid);
+    }
+
+    protected function createEpisode(): mixed
+    {
+        return DB::selectOne('INSERT INTO episodes (title, description) VALUES (?, ?) RETURNING uuid', [
+            'Sample Episode for Testing',
+            'This is a test episode with nested structure',
+        ]);
+    }
+
+    protected function createPart(string $episodeUuid, int $p): mixed
+    {
+        return DB::selectOne('INSERT INTO parts (episode_uuid, name, description) VALUES (?, ?, ?) RETURNING uuid', [
+            $episodeUuid,
+            'Part ' . $p,
+            'Description for part ' . $p,
+        ]);
+    }
+
+    protected function createItem(string $partUuid, int $i, int $p): mixed
+    {
+        return DB::selectOne('INSERT INTO items (part_uuid, name, details) VALUES (?, ?, ?) RETURNING uuid', [
+            $partUuid,
+            'Item ' . $i . ' of Part ' . $p,
+            'Details for item ' . $i,
+        ]);
+    }
+
+    protected function createBlock(string $itemUuid, string $blockType, int $i): mixed
+    {
+        return DB::selectOne('INSERT INTO blocks (item_uuid, type, description) VALUES (?, ?, ?) RETURNING uuid', [
+            $itemUuid,
+            $blockType,
+            'Block ' . $i . ' description',
+        ]);
+    }
+
+    protected function createBlockField(string $blockUuid, int $blockField): void
+    {
+        DB::insert('INSERT INTO block_fields (block_uuid, field_name, field_value, field_type) VALUES (?, ?, ?, ?)', [
+            $blockUuid,
+            'field_' . $blockField,
+            'Value ' . $blockField . ' for block',
+            'string',
+        ]);
+    }
+
+    protected function createMedia(string $itemUuid, string $blockUuid, string $blockType, int $i): void
+    {
+        $extension = $i === 2 ? 'jpg' : 'mp4';
+        $contentType = $i === 2 ? 'image/jpeg' : 'video/mp4';
+
+        $s3Key = 'media/' . $itemUuid . '/' . Str::uuid() . '.' . $extension;
+        $dummyContent = 'Dummy ' . $blockType . ' content for testing';
+
+        $this->s3Client->putObject([
+            'Bucket' => $this->bucket,
+            'Key' => $s3Key,
+            'Body' => $dummyContent,
+            'ContentType' => $contentType,
+        ]);
+
+        $url = $this->s3Client->getObjectUrl($this->bucket, $s3Key);
+
+        DB::insert(
+            'INSERT INTO media (block_uuid, media_type, s3_key, s3_bucket, url, metadata) VALUES (?, ?, ?, ?, ?, ?::jsonb)',
+            [
+                $blockUuid,
+                $contentType,
+                $s3Key,
+                $this->bucket,
+                $url,
+                json_encode(['size' => strlen($dummyContent), 'width' => 800, 'height' => 600]),
+            ]
+        );
     }
 }

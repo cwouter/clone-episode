@@ -2,46 +2,63 @@
 
 namespace App\Jobs;
 
-use App\Services\CloneService;
+use App\Events\RecursiveCloneBlocksCommand;
+use App\Events\RevertRecursiveCloneBlocksCommand;
+use App\Services\BlockService;
 use App\Services\IdempotencyService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Log\Logger;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Redis;
 use Throwable;
 
 class RecursiveCloneBlocksCommandHandler implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    public object $command;
-
-    public function __construct(object $command)
+    public function __construct(protected RecursiveCloneBlocksCommand $command)
     {
-        $this->command = $command;
     }
 
-    public function handle(CloneService $cloneService, IdempotencyService $idempotencyService): void
+    /**
+     * @throws Throwable
+     */
+    public function handle(BlockService $blockService, IdempotencyService $idempotencyService, Logger $log): void
     {
+        $log->info(self::class . ' started', ['command' => $this->command]);
+
         if ($idempotencyService->isProcessed($this->command->transactionId)) {
             return;
         }
 
-        $itemMappingJson = Redis::get("clone:items:{$this->command->traceId}");
-        $itemMapping = $itemMappingJson !== null ? json_decode($itemMappingJson, true) : [];
+        try {
+            $blockMapping = $blockService->cloneBlocks(
+                $this->command->blocks,
+                $this->command->newItemUuid
+            );
 
-        $blockUuids = $this->command->blocks;
+            if ($blockMapping !== []) {
+                $blockService->cloneBlockFields($blockMapping);
+                $blockService->cloneMedia($blockMapping, $this->command->newItemUuid);
+            }
 
-        $blockMapping = $cloneService->cloneBlocks($blockUuids, $itemMapping);
+            $idempotencyService->markAsProcessed($this->command->transactionId, (int)config('cloning.transaction_ttl'));
+        } catch (Throwable $e) {
+            $log->error("Failed to clone blocks: " . $e->getMessage());
+            $this->performRollback($e);
 
-        if ($blockMapping !== []) {
-            $cloneService->cloneBlockFields($blockMapping);
-            $cloneService->cloneMedia($blockMapping);
+            throw $e;
         }
+    }
 
-        $idempotencyService->markAsProcessed($this->command->transactionId, (int) config('cloning.transaction_ttl'));
+    public function performRollback(Throwable $e): void
+    {
+        $this->fail($e);
+        $command = RevertRecursiveCloneBlocksCommand::fromCommand($this->command);
+        $command->itemUuid = $this->command->newItemUuid;
+        RevertRecursiveCloneBlocksCommandHandler::dispatch($command);
     }
 
     public function failed(Throwable $exception): void

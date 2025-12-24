@@ -14,23 +14,19 @@ class RecursiveCloneController extends Controller
 {
     public function store(RecursiveCloneEpisodeRequest $request): JsonResponse
     {
+        $traceId = (string)Str::uuid();
         $episodeUuid = $request->validated('episode_uuid');
-
         $episode = DB::selectOne('SELECT uuid FROM episodes WHERE uuid = ?', [$episodeUuid]);
 
         if ($episode === null) {
             return response()->json([
                 'status' => 'error',
+                'trace_id' => $traceId,
                 'message' => 'Episode not found',
             ], 404);
         }
 
-        $traceId = (string) Str::uuid();
-        $transactionId = (string) Str::uuid();
-
-        $command = new RecursiveCloneEpisodeCommand();
-        $command->traceId = $traceId;
-        $command->transactionId = $transactionId;
+        $command = new RecursiveCloneEpisodeCommand($traceId);
         $command->episodeUuid = $episodeUuid;
 
         RecursiveCloneEpisodeCommandHandler::dispatch($command);
@@ -38,7 +34,7 @@ class RecursiveCloneController extends Controller
         return response()->json([
             'status' => 'accepted',
             'trace_id' => $traceId,
-            'transaction_id' => $transactionId,
+            'transaction_id' => $command->transactionId,
             'message' => 'Recursive clone process initiated',
         ]);
     }
